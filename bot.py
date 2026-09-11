@@ -18,8 +18,8 @@ from aiogram.types import (
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "8734513499:AAFZDaHlEjpaX6ortyReXvOsZVkILjuvvXg"
 YANDEX_TOKEN = "y0__wgBEPjki3kYgZ1JILi2__sYLPDQfkenDEMWbYxyndaagHUROe0"
-ALLOWED_USERS = [659684962, 5509198477]  # Telegram ID пользователей, которым открыт доступ
-ROOT_DIR = "disk:/TelegramBot"  # Базовая папка в Яндекс Диске
+ALLOWED_USERS = [659684962, 5509198477]
+ROOT_DIR = "disk:/TelegramBot"
 # ================================================
 
 bot = Bot(token=BOT_TOKEN)
@@ -42,7 +42,7 @@ def cache_item(path: str, name: str, is_dir: bool, size: int = 0) -> int:
     return item_id
 
 async def notify_team(sender_id: int, text: str):
-    """Отправляет оповещение остальным участникам команды"""
+    """Оповещение участников команды"""
     for user_id in ALLOWED_USERS:
         if user_id != sender_id:
             try:
@@ -56,30 +56,46 @@ async def notify_team(sender_id: int, text: str):
 YANDEX_HEADERS = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
 API_URL = "https://cloud-api.yandex.net/v1/disk/resources"
 
-async def yd_create_folder(path: str) -> bool:
+async def yd_create_folder(path: str) -> tuple[bool, str]:
+    """Создает папку и возвращает (успех, сообщение ошибки)"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.put(API_URL, params={"path": path}) as resp:
-            return resp.status in (201, 409)
+            if resp.status in (201, 409):
+                return True, ""
+            err_text = await resp.text()
+            return False, f"HTTP {resp.status}: {err_text}"
 
-async def yd_get_contents(path: str) -> list[dict]:
+async def yd_get_contents(path: str) -> tuple[list[dict], str]:
+    """Получает содержимое папки с локальной сортировкой"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
-        async with session.get(API_URL, params={"path": path, "limit": 100, "sort": "name"}) as resp:
+        # Убран параметр sort, чтобы исключить 400 Bad Request от API
+        async with session.get(API_URL, params={"path": path, "limit": 100}) as resp:
             if resp.status != 200:
-                return []
+                err_text = await resp.text()
+                return [], f"HTTP {resp.status}: {err_text}"
             data = await resp.json()
-            return data.get("_embedded", {}).get("items", [])
+            items = data.get("_embedded", {}).get("items", [])
+            # Сортировка по имени средствами Python
+            sorted_items = sorted(items, key=lambda x: x.get("name", "").lower())
+            return sorted_items, ""
 
-async def yd_upload_file(path: str, file_bytes: bytes) -> bool:
+async def yd_upload_file(path: str, file_bytes: bytes) -> tuple[bool, str]:
+    """Загружает файл в облако"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.get(f"{API_URL}/upload", params={"path": path, "overwrite": "true"}) as resp:
             if resp.status != 200:
-                return False
+                err = await resp.text()
+                return False, f"Не удалось получить URL загрузки ({resp.status}): {err}"
             upload_url = (await resp.json()).get("href")
 
         async with session.put(upload_url, data=file_bytes) as upload_resp:
-            return upload_resp.status in (201, 202)
+            if upload_resp.status in (201, 202):
+                return True, ""
+            err = await upload_resp.text()
+            return False, f"Ошибка отправки данных ({upload_resp.status}): {err}"
 
 async def yd_download_file(path: str) -> bytes | None:
+    """Скачивает файл из облака"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.get(f"{API_URL}/download", params={"path": path}) as resp:
             if resp.status != 200:
@@ -116,13 +132,17 @@ async def yd_publish_and_get_link(path: str) -> str | None:
 def get_folder_keyboard(current_path: str, items: list[dict]) -> InlineKeyboardMarkup:
     buttons = []
 
+    # Папки
     for item in items:
-        if item["type"] == "dir":
+        item_type = item.get("type") or item.get("resource_type")
+        if item_type == "dir":
             item_id = cache_item(item["path"], item["name"], True)
             buttons.append([InlineKeyboardButton(text=f"📁 {item['name']}", callback_data=f"nav_dir:{item_id}")])
 
+    # Файлы
     for item in items:
-        if item["type"] == "file":
+        item_type = item.get("type") or item.get("resource_type")
+        if item_type == "file":
             item_id = cache_item(item["path"], item["name"], False, item.get("size", 0))
             buttons.append([InlineKeyboardButton(text=f"📄 {item['name']}", callback_data=f"nav_file:{item_id}")])
 
@@ -182,8 +202,21 @@ async def start_handler(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    await yd_create_folder(ROOT_DIR)
-    items = await yd_get_contents(ROOT_DIR)
+    success, err = await yd_create_folder(ROOT_DIR)
+    if not success:
+        await message.answer(
+            f"⚠️ <b>Ошибка доступа к Яндекс Диску!</b>\n\n"
+            f"Код: <code>{err}</code>\n\n"
+            f"Проверьте OAuth-токен и права приложения в Яндекс ID.",
+            parse_mode="HTML"
+        )
+        return
+
+    items, get_err = await yd_get_contents(ROOT_DIR)
+    if get_err:
+        await message.answer(f"⚠️ <b>Ошибка чтения Диска:</b> <code>{get_err}</code>", parse_mode="HTML")
+        return
+
     kb = get_folder_keyboard(ROOT_DIR, items)
     await message.answer("☁️ <b>Файлы проектов на Яндекс Диске:</b>", reply_markup=kb, parse_mode="HTML")
 
@@ -197,9 +230,12 @@ async def navigate_dir(callback: CallbackQuery, state: FSMContext):
     folder_info = items_cache.get(folder_id, {"path": ROOT_DIR})
     path = folder_info["path"]
 
-    items = await yd_get_contents(path)
-    display_path = path.replace("disk:/", "/")
+    items, err = await yd_get_contents(path)
+    if err:
+        await callback.answer(f"Ошибка загрузки: {err[:40]}", show_alert=True)
+        return
 
+    display_path = path.replace("disk:/", "/")
     await callback.message.edit_text(
         f"📁 <b>Текущая папка:</b> <code>{display_path}</code>",
         reply_markup=get_folder_keyboard(path, items),
@@ -274,7 +310,7 @@ async def share_link_handler(callback: CallbackQuery):
             parse_mode="HTML"
         )
     else:
-        await callback.message.answer("Не удалось получить публичную ссылку.")
+        await callback.message.answer("Не удалось получить ссылку.")
 
 @dp.callback_query(F.data.startswith("act_replace:"))
 async def init_replace_handler(callback: CallbackQuery, state: FSMContext):
@@ -289,9 +325,9 @@ async def init_replace_handler(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text(
         f"🔄 <b>Замена на новую версию</b>\n\n"
-        f"Вы обновляете файл: <code>{file_info['name']}</code>\n\n"
-        f"Отправьте новый документ в этот чат (файлом без сжатия).\n"
-        f"<i>Старая версия будет заменена на актуальную.</i>",
+        f"Вы обновляете: <code>{file_info['name']}</code>\n\n"
+        f"Отправьте новый документ в чат (без сжатия).\n"
+        f"<i>Старая версия будет перезаписана.</i>",
         reply_markup=cancel_kb,
         parse_mode="HTML"
     )
@@ -314,7 +350,7 @@ async def process_replace_file(message: Message, state: FSMContext):
     await bot.download(message.document, destination=stream)
     file_bytes = stream.getvalue()
 
-    success = await yd_upload_file(target_path, file_bytes)
+    success, err = await yd_upload_file(target_path, file_bytes)
     await state.clear()
     await load_msg.delete()
 
@@ -328,14 +364,14 @@ async def process_replace_file(message: Message, state: FSMContext):
                  f"📁 Папка: <code>{parent_path.replace('disk:/', '/')}</code>"
         )
 
-        items = await yd_get_contents(parent_path)
+        items, _ = await yd_get_contents(parent_path)
         await message.answer(
-            f"✅ Проект <code>{original_name}</code> успешно обновлен на актуальную версию!",
+            f"✅ Проект <code>{original_name}</code> успешно обновлен!",
             reply_markup=get_folder_keyboard(parent_path, items),
             parse_mode="HTML"
         )
     else:
-        await message.answer("❌ Ошибка при замене файла в Яндекс Диске.")
+        await message.answer(f"❌ <b>Ошибка обновления:</b>\n<code>{err}</code>", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("act_delete_confirm:"))
 async def confirm_delete_prompt(callback: CallbackQuery):
@@ -347,8 +383,8 @@ async def confirm_delete_prompt(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"❓ <b>Подтверждение удаления</b>\n\n"
-        f"Вы действительно хотите удалить проект <code>{file_info['name']}</code>?\n"
-        f"<i>(Файл будет перемещен в Корзину Яндекс Диска)</i>",
+        f"Удалить проект <code>{file_info['name']}</code>?\n"
+        f"<i>(Файл переместится в Корзину Диска)</i>",
         reply_markup=get_confirm_delete_keyboard(item_id),
         parse_mode="HTML"
     )
@@ -374,7 +410,7 @@ async def delete_confirmed_handler(callback: CallbackQuery):
              f"📄 Файл: <code>{file_info['name']}</code>"
     )
 
-    items = await yd_get_contents(parent_path)
+    items, _ = await yd_get_contents(parent_path)
     await callback.message.edit_text(
         f"📁 <b>Папка обновлена</b>",
         reply_markup=get_folder_keyboard(parent_path, items),
@@ -417,7 +453,7 @@ async def process_file_upload(message: Message, state: FSMContext):
     await bot.download(message.document, destination=stream)
     file_bytes = stream.getvalue()
 
-    success = await yd_upload_file(destination, file_bytes)
+    success, err = await yd_upload_file(destination, file_bytes)
     await state.clear()
     await load_msg.delete()
 
@@ -431,14 +467,14 @@ async def process_file_upload(message: Message, state: FSMContext):
                  f"📁 Папка: <code>{target_path.replace('disk:/', '/')}</code>"
         )
 
-        items = await yd_get_contents(target_path)
+        items, _ = await yd_get_contents(target_path)
         await message.answer(
             f"✅ Файл <code>{filename}</code> добавлен!",
             reply_markup=get_folder_keyboard(target_path, items),
             parse_mode="HTML"
         )
     else:
-        await message.answer("❌ Ошибка при отправке файла.")
+        await message.answer(f"❌ <b>Ошибка при сохранении:</b>\n<code>{err}</code>", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("add_folder:"))
 async def init_create_folder(callback: CallbackQuery, state: FSMContext):
@@ -465,10 +501,17 @@ async def process_create_folder(message: Message, state: FSMContext):
     target_path = data.get("target_path", ROOT_DIR)
     new_folder_path = f"{target_path}/{folder_name}"
 
-    await yd_create_folder(new_folder_path)
+    success, err_msg = await yd_create_folder(new_folder_path)
     await state.clear()
 
-    items = await yd_get_contents(target_path)
+    if not success:
+        await message.answer(
+            f"❌ <b>Не удалось создать папку на Яндекс Диске:</b>\n<code>{err_msg}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    items, _ = await yd_get_contents(target_path)
     await message.answer(
         f"✅ Папка <code>{folder_name}</code> создана!",
         reply_markup=get_folder_keyboard(target_path, items),
@@ -506,7 +549,7 @@ async def process_rename(message: Message, state: FSMContext):
     await state.clear()
 
     if success:
-        items = await yd_get_contents(parent_path)
+        items, _ = await yd_get_contents(parent_path)
         await message.answer(
             f"✅ Переименовано в <code>{new_name}</code>",
             reply_markup=get_folder_keyboard(parent_path, items),
@@ -515,7 +558,6 @@ async def process_rename(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Ошибка при переименовании.")
 
-# Исправленная кнопка отмены
 @dp.callback_query(F.data == "cancel_fsm")
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ALLOWED_USERS:
@@ -540,7 +582,7 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
         )
     else:
         folder_path = target_path if "." not in target_path.split("/")[-1] else target_path.rsplit("/", 1)[0]
-        items = await yd_get_contents(folder_path)
+        items, _ = await yd_get_contents(folder_path)
         display_path = folder_path.replace("disk:/", "/")
         await callback.message.edit_text(
             f"📁 <b>Текущая папка:</b> <code>{display_path}</code>",
