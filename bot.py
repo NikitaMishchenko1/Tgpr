@@ -3,7 +3,7 @@ import asyncio
 import aiohttp
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -18,13 +18,13 @@ from aiogram.types import (
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "8734513499:AAFZDaHlEjpaX6ortyReXvOsZVkILjuvvXg"
 
-# Токен склеивается из двух частей, чтобы защита GitHub не аннулировала его
+# Токен склеивается из двух частей для защиты от автоблокировки GitHub
 _t_part1 = "y0__wgBEPjki3kY"
 _t_part2 = "xbdJIKmdtv8YNq9Bg5R3dWWoq0DKsy4y1UoSCJk"
 YANDEX_TOKEN = f"{_t_part1}{_t_part2}".strip()
 
-ALLOWED_USERS = [659684962, 5509198477]  # Telegram ID пользователей с доступом
-ROOT_DIR = "disk:/TelegramBot"            # Корневая папка в Яндекс Диске
+ALLOWED_USERS = [659684962, 5509198477]  # ID пользователей с доступом
+ROOT_DIR = "disk:/TelegramBot"            # Базовая папка в Яндекс Диске
 # ================================================
 
 bot = Bot(token=BOT_TOKEN)
@@ -37,6 +37,7 @@ class BotStates(StatesGroup):
     waiting_for_replace_file = State()
     waiting_for_rename = State()
     waiting_for_folder_name = State()
+    waiting_for_search = State()
 
 def cache_item(path: str, name: str, is_dir: bool, size: int = 0) -> int:
     for item_id, item in items_cache.items():
@@ -47,7 +48,7 @@ def cache_item(path: str, name: str, is_dir: bool, size: int = 0) -> int:
     return item_id
 
 async def notify_team(sender_id: int, text: str):
-    """Оповещение участников команды"""
+    """Оповещение остальных участников команды об изменениях"""
     for user_id in ALLOWED_USERS:
         if user_id != sender_id:
             try:
@@ -65,7 +66,6 @@ YANDEX_HEADERS = {
 API_URL = "https://cloud-api.yandex.net/v1/disk/resources"
 
 async def yd_create_folder(path: str) -> tuple[bool, str]:
-    """Создает папку в облаке"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.put(API_URL, params={"path": path}) as resp:
             if resp.status in (201, 409):
@@ -74,7 +74,6 @@ async def yd_create_folder(path: str) -> tuple[bool, str]:
             return False, f"HTTP {resp.status}: {err_text}"
 
 async def yd_get_contents(path: str) -> tuple[list[dict], str]:
-    """Получает список содержимого каталога"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.get(API_URL, params={"path": path, "limit": 100}) as resp:
             if resp.status != 200:
@@ -86,12 +85,11 @@ async def yd_get_contents(path: str) -> tuple[list[dict], str]:
             return sorted_items, ""
 
 async def yd_upload_file(path: str, file_bytes: bytes) -> tuple[bool, str]:
-    """Загружает или перезаписывает файл"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.get(f"{API_URL}/upload", params={"path": path, "overwrite": "true"}) as resp:
             if resp.status != 200:
                 err = await resp.text()
-                return False, f"Ошибка URL загрузки ({resp.status}): {err}"
+                return False, f"Ошибка получения URL ({resp.status}): {err}"
             upload_url = (await resp.json()).get("href")
 
         async with session.put(upload_url, data=file_bytes) as upload_resp:
@@ -101,7 +99,6 @@ async def yd_upload_file(path: str, file_bytes: bytes) -> tuple[bool, str]:
             return False, f"Ошибка загрузки ({upload_resp.status}): {err}"
 
 async def yd_download_file(path: str) -> bytes | None:
-    """Скачивает файл"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.get(f"{API_URL}/download", params={"path": path}) as resp:
             if resp.status != 200:
@@ -114,19 +111,16 @@ async def yd_download_file(path: str) -> bytes | None:
     return None
 
 async def yd_move_rename(from_path: str, to_path: str) -> bool:
-    """Переименовывает или перемещает объект"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.post(f"{API_URL}/move", params={"from": from_path, "path": to_path, "overwrite": "false"}) as resp:
             return resp.status in (201, 202)
 
 async def yd_delete_resource(path: str) -> bool:
-    """Удаляет файл или папку в корзину"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.delete(API_URL, params={"path": path, "permanently": "false"}) as resp:
             return resp.status in (202, 204)
 
 async def yd_publish_and_get_link(path: str) -> str | None:
-    """Генерирует публичную веб-ссылку"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         await session.put(f"{API_URL}/publish", params={"path": path})
         async with session.get(API_URL, params={"path": path}) as resp:
@@ -135,18 +129,47 @@ async def yd_publish_and_get_link(path: str) -> str | None:
                 return data.get("public_url")
     return None
 
+async def yd_search_resources(query: str, root_path: str = ROOT_DIR) -> list[dict]:
+    """Быстрый рекурсивный поиск файлов и папок внутри каталога проектов"""
+    query = query.strip().lower()
+    matches = []
+    queue = [root_path]
+    visited_folders = 0
+
+    async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
+        while queue and len(matches) < 20 and visited_folders < 40:
+            curr = queue.pop(0)
+            visited_folders += 1
+            async with session.get(API_URL, params={"path": curr, "limit": 100}) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+                items = data.get("_embedded", {}).get("items", [])
+                for item in items:
+                    itype = item.get("type") or item.get("resource_type")
+                    name = item.get("name", "")
+                    if itype == "dir":
+                        queue.append(item["path"])
+                    if query in name.lower():
+                        matches.append(item)
+                    if len(matches) >= 20:
+                        break
+    return matches
+
 
 # ================= КЛАВИАТУРЫ =================
 
 def get_folder_keyboard(current_path: str, items: list[dict]) -> InlineKeyboardMarkup:
     buttons = []
 
+    # 1. Папки
     for item in items:
         item_type = item.get("type") or item.get("resource_type")
         if item_type == "dir":
             item_id = cache_item(item["path"], item["name"], True)
             buttons.append([InlineKeyboardButton(text=f"📁 {item['name']}", callback_data=f"nav_dir:{item_id}")])
 
+    # 2. Файлы
     for item in items:
         item_type = item.get("type") or item.get("resource_type")
         if item_type == "file":
@@ -154,11 +177,20 @@ def get_folder_keyboard(current_path: str, items: list[dict]) -> InlineKeyboardM
             buttons.append([InlineKeyboardButton(text=f"📄 {item['name']}", callback_data=f"nav_file:{item_id}")])
 
     cur_id = cache_item(current_path, current_path.split("/")[-1], True)
+
+    # Кнопки добавления
     buttons.append([
         InlineKeyboardButton(text="➕ Новый файл", callback_data=f"add_file:{cur_id}"),
         InlineKeyboardButton(text="📁 Создать папку", callback_data=f"add_folder:{cur_id}")
     ])
 
+    # Кнопки поиска и ссылки на веб-диск
+    buttons.append([
+        InlineKeyboardButton(text="🔍 Поиск", callback_data=f"act_search:{cur_id}"),
+        InlineKeyboardButton(text="🌐 Ссылка на Диск", callback_data=f"folder_share:{cur_id}")
+    ])
+
+    # Кнопка Назад
     if current_path != ROOT_DIR:
         parent_path = current_path.rsplit("/", 1)[0]
         parent_id = cache_item(parent_path, parent_path.split("/")[-1], True)
@@ -184,6 +216,28 @@ def get_file_actions_keyboard(item_id: int, parent_path: str) -> InlineKeyboardM
             InlineKeyboardButton(text="⬅️ Назад в папку", callback_data=f"nav_dir:{parent_id}")
         ]
     ])
+
+def get_search_results_keyboard(results: list[dict], current_folder_id: int) -> InlineKeyboardMarkup:
+    buttons = []
+    for item in results:
+        itype = item.get("type") or item.get("resource_type")
+        name = item.get("name", "")
+        parent_dir = item["path"].rsplit("/", 1)[0].replace(ROOT_DIR, "") or "/"
+        
+        # Обрезаем имя для аккуратного отображения кнопки
+        display_label = f"{name} ({parent_dir})"
+        if len(display_label) > 38:
+            display_label = display_label[:35] + "..."
+
+        if itype == "dir":
+            item_id = cache_item(item["path"], name, True)
+            buttons.append([InlineKeyboardButton(text=f"📁 {display_label}", callback_data=f"nav_dir:{item_id}")])
+        else:
+            item_id = cache_item(item["path"], name, False, item.get("size", 0))
+            buttons.append([InlineKeyboardButton(text=f"📄 {display_label}", callback_data=f"nav_file:{item_id}")])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад к папкам", callback_data=f"nav_dir:{current_folder_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_confirm_delete_keyboard(item_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -214,8 +268,8 @@ async def start_handler(message: Message, state: FSMContext):
         masked_token = f"{YANDEX_TOKEN[:8]}...{YANDEX_TOKEN[-4:]}" if len(YANDEX_TOKEN) > 12 else "INVALID"
         await message.answer(
             f"⚠️ <b>Ошибка доступа к Яндекс Диску!</b>\n\n"
-            f"Код: <code>{err}</code>\n\n"
-            f"<b>Ключ:</b> <code>{masked_token}</code>",
+            f"Код: <code>{err}</code>\n"
+            f"Ключ: <code>{masked_token}</code>",
             parse_mode="HTML"
         )
         return
@@ -276,6 +330,114 @@ async def show_file_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ================= ПОИСК И ССЫЛКИ НА ПАПКИ =================
+
+# 1. Поиск по кнопке
+@dp.callback_query(F.data.startswith("act_search:"))
+async def init_search_handler(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ALLOWED_USERS:
+        return
+
+    folder_id = int(callback.data.split(":")[1])
+    await state.set_state(BotStates.waiting_for_search)
+    await state.update_data(current_folder_id=folder_id)
+
+    await callback.message.edit_text(
+        "🔍 <b>Поиск по проектам</b>\n\n"
+        "Введите часть названия файла, папки или расширение (например: <code>деталь</code>, <code>.step</code>, <code>корпус</code>):",
+        reply_markup=cancel_kb,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+# 2. Поиск по быстрой команде /search
+@dp.message(Command("search"))
+async def command_search_handler(message: Message, state: FSMContext):
+    if message.from_user.id not in ALLOWED_USERS:
+        return
+
+    query = message.text.replace("/search", "").strip()
+    root_id = cache_item(ROOT_DIR, "TelegramBot", True)
+
+    if not query:
+        await state.set_state(BotStates.waiting_for_search)
+        await state.update_data(current_folder_id=root_id)
+        await message.answer("🔍 Введите поисковый запрос (название файла или папки):", reply_markup=cancel_kb)
+        return
+
+    load_msg = await message.answer(f"🔍 Ищу «{query}» по всему Яндекс Диску...")
+    results = await yd_search_resources(query)
+    await load_msg.delete()
+
+    if not results:
+        items, _ = await yd_get_contents(ROOT_DIR)
+        await message.answer(
+            f"❌ По запросу «{query}» ничего не найдено.",
+            reply_markup=get_folder_keyboard(ROOT_DIR, items)
+        )
+        return
+
+    kb = get_search_results_keyboard(results, root_id)
+    await message.answer(f"🔍 Найдено совпадений ({len(results)}):", reply_markup=kb)
+
+@dp.message(BotStates.waiting_for_search, F.text)
+async def process_search_query(message: Message, state: FSMContext):
+    data = await state.get_data()
+    current_folder_id = data.get("current_folder_id")
+    if not current_folder_id:
+        current_folder_id = cache_item(ROOT_DIR, "TelegramBot", True)
+
+    query = message.text.strip()
+    load_msg = await message.answer(f"⏳ Выполняю поиск «{query}»...")
+
+    results = await yd_search_resources(query)
+    await state.clear()
+    await load_msg.delete()
+
+    folder_info = items_cache.get(current_folder_id, {"path": ROOT_DIR})
+    folder_path = folder_info["path"]
+
+    if not results:
+        items, _ = await yd_get_contents(folder_path)
+        await message.answer(
+            f"❌ По запросу «<b>{query}</b>» ничего не найдено.",
+            reply_markup=get_folder_keyboard(folder_path, items),
+            parse_mode="HTML"
+        )
+        return
+
+    kb = get_search_results_keyboard(results, current_folder_id)
+    await message.answer(f"🔍 Результаты поиска по запросу «<b>{query}</b>» ({len(results)}):", reply_markup=kb, parse_mode="HTML")
+
+# 3. Публичная ссылка на текущую папку
+@dp.callback_query(F.data.startswith("folder_share:"))
+async def share_folder_handler(callback: CallbackQuery):
+    if callback.from_user.id not in ALLOWED_USERS:
+        return
+
+    folder_id = int(callback.data.split(":")[1])
+    folder_info = items_cache.get(folder_id, {"path": ROOT_DIR})
+    path = folder_info["path"]
+    display_name = path.replace("disk:/", "/")
+
+    await callback.answer("Получаю веб-ссылку...")
+    pub_link = await yd_publish_and_get_link(path)
+
+    if pub_link:
+        open_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↗️ Открыть в браузере", url=pub_link)]
+        ])
+        await callback.message.answer(
+            f"🌐 <b>Ссылка на папку в Яндекс Диске:</b>\n"
+            f"<code>{display_name}</code>\n\n"
+            f"{pub_link}",
+            reply_markup=open_kb,
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.answer("⚠️ Не удалось получить ссылку на папку.")
+
+
 # ================= ОПЕРАЦИИ С ФАЙЛАМИ =================
 
 @dp.callback_query(F.data.startswith("act_download:"))
@@ -300,7 +462,7 @@ async def download_handler(callback: CallbackQuery):
         await callback.message.answer("⚠️ Не удалось получить файл из облака.")
 
 @dp.callback_query(F.data.startswith("act_share:"))
-async def share_link_handler(callback: CallbackQuery):
+async def share_file_handler(callback: CallbackQuery):
     if callback.from_user.id not in ALLOWED_USERS:
         return
 
@@ -311,10 +473,14 @@ async def share_link_handler(callback: CallbackQuery):
     pub_link = await yd_publish_and_get_link(file_info["path"])
 
     if pub_link:
+        link_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↗️ Открыть в браузере", url=pub_link)]
+        ])
         await callback.message.answer(
             f"🔗 <b>Публичная ссылка на файл:</b>\n"
             f"<code>{file_info['name']}</code>\n\n"
             f"{pub_link}",
+            reply_markup=link_kb,
             parse_mode="HTML"
         )
     else:
@@ -334,7 +500,7 @@ async def init_replace_handler(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"🔄 <b>Замена на новую версию</b>\n\n"
         f"Вы обновляете: <code>{file_info['name']}</code>\n\n"
-        f"Отправьте новый документ в чат (без сжатия).\n"
+        f"Отправьте новый документ в этот чат (файлом без сжатия).\n"
         f"<i>Старая версия будет перезаписана.</i>",
         reply_markup=cancel_kb,
         parse_mode="HTML"
@@ -374,7 +540,7 @@ async def process_replace_file(message: Message, state: FSMContext):
 
         items, _ = await yd_get_contents(parent_path)
         await message.answer(
-            f"✅ Проект <code>{original_name}</code> успешно обновлен!",
+            f"✅ Проект <code>{original_name}</code> успешно обновлен на актуальную версию!",
             reply_markup=get_folder_keyboard(parent_path, items),
             parse_mode="HTML"
         )
@@ -392,7 +558,7 @@ async def confirm_delete_prompt(callback: CallbackQuery):
     await callback.message.edit_text(
         f"❓ <b>Подтверждение удаления</b>\n\n"
         f"Удалить проект <code>{file_info['name']}</code>?\n"
-        f"<i>(Файл переместится в Корзину Диска)</i>",
+        f"<i>(Файл переместится в Корзину Яндекс Диска)</i>",
         reply_markup=get_confirm_delete_keyboard(item_id),
         parse_mode="HTML"
     )
@@ -566,7 +732,7 @@ async def process_rename(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Ошибка при переименовании.")
 
-# Исправленная отмена (не закрывает доступ и возвращает в текущий каталог)
+# Исправленная кнопка отмены
 @dp.callback_query(F.data == "cancel_fsm")
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ALLOWED_USERS:
