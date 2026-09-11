@@ -1,3 +1,4 @@
+import os
 import io
 import asyncio
 import aiohttp
@@ -16,8 +17,8 @@ from aiogram.types import (
 )
 
 # ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = "8734513499:AAFZDaHlEjpaX6ortyReXvOsZVkILjuvvXg"
-YANDEX_TOKEN = "y0__wgBEPjki3kYxbdJIKmdtv8YNq9Bg5R3dWWoq0DKsy4y1UoSCJk"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8734513499:AAFZDaHlEjpaX6ortyReXvOsZVkILjuvvXg").strip()
+YANDEX_TOKEN = os.getenv("YANDEX_TOKEN", "y0__wgBEPjki3kYxbdJIKmdtv8YNq9Bg5R3dWWoq0DKsy4y1UoSCJk").strip()
 ALLOWED_USERS = [659684962, 5509198477]
 ROOT_DIR = "disk:/TelegramBot"
 # ================================================
@@ -42,7 +43,6 @@ def cache_item(path: str, name: str, is_dir: bool, size: int = 0) -> int:
     return item_id
 
 async def notify_team(sender_id: int, text: str):
-    """Оповещение участников команды"""
     for user_id in ALLOWED_USERS:
         if user_id != sender_id:
             try:
@@ -53,11 +53,13 @@ async def notify_team(sender_id: int, text: str):
 
 # ================= РАБОТА С ЯНДЕКС ДИСКОМ =================
 
-YANDEX_HEADERS = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+YANDEX_HEADERS = {
+    "Authorization": f"OAuth {YANDEX_TOKEN}",
+    "Accept": "application/json"
+}
 API_URL = "https://cloud-api.yandex.net/v1/disk/resources"
 
 async def yd_create_folder(path: str) -> tuple[bool, str]:
-    """Создает папку и возвращает (успех, сообщение ошибки)"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.put(API_URL, params={"path": path}) as resp:
             if resp.status in (201, 409):
@@ -66,36 +68,31 @@ async def yd_create_folder(path: str) -> tuple[bool, str]:
             return False, f"HTTP {resp.status}: {err_text}"
 
 async def yd_get_contents(path: str) -> tuple[list[dict], str]:
-    """Получает содержимое папки с локальной сортировкой"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
-        # Убран параметр sort, чтобы исключить 400 Bad Request от API
         async with session.get(API_URL, params={"path": path, "limit": 100}) as resp:
             if resp.status != 200:
                 err_text = await resp.text()
                 return [], f"HTTP {resp.status}: {err_text}"
             data = await resp.json()
             items = data.get("_embedded", {}).get("items", [])
-            # Сортировка по имени средствами Python
             sorted_items = sorted(items, key=lambda x: x.get("name", "").lower())
             return sorted_items, ""
 
 async def yd_upload_file(path: str, file_bytes: bytes) -> tuple[bool, str]:
-    """Загружает файл в облако"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.get(f"{API_URL}/upload", params={"path": path, "overwrite": "true"}) as resp:
             if resp.status != 200:
                 err = await resp.text()
-                return False, f"Не удалось получить URL загрузки ({resp.status}): {err}"
+                return False, f"Ошибка ссылки загрузки ({resp.status}): {err}"
             upload_url = (await resp.json()).get("href")
 
         async with session.put(upload_url, data=file_bytes) as upload_resp:
             if upload_resp.status in (201, 202):
                 return True, ""
             err = await upload_resp.text()
-            return False, f"Ошибка отправки данных ({upload_resp.status}): {err}"
+            return False, f"Ошибка передачи файла ({upload_resp.status}): {err}"
 
 async def yd_download_file(path: str) -> bytes | None:
-    """Скачивает файл из облака"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.get(f"{API_URL}/download", params={"path": path}) as resp:
             if resp.status != 200:
@@ -132,14 +129,12 @@ async def yd_publish_and_get_link(path: str) -> str | None:
 def get_folder_keyboard(current_path: str, items: list[dict]) -> InlineKeyboardMarkup:
     buttons = []
 
-    # Папки
     for item in items:
         item_type = item.get("type") or item.get("resource_type")
         if item_type == "dir":
             item_id = cache_item(item["path"], item["name"], True)
             buttons.append([InlineKeyboardButton(text=f"📁 {item['name']}", callback_data=f"nav_dir:{item_id}")])
 
-    # Файлы
     for item in items:
         item_type = item.get("type") or item.get("resource_type")
         if item_type == "file":
@@ -207,7 +202,7 @@ async def start_handler(message: Message, state: FSMContext):
         await message.answer(
             f"⚠️ <b>Ошибка доступа к Яндекс Диску!</b>\n\n"
             f"Код: <code>{err}</code>\n\n"
-            f"Проверьте OAuth-токен и права приложения в Яндекс ID.",
+            f"Проверьте статус токена и приватность репозитория.",
             parse_mode="HTML"
         )
         return
@@ -232,7 +227,7 @@ async def navigate_dir(callback: CallbackQuery, state: FSMContext):
 
     items, err = await yd_get_contents(path)
     if err:
-        await callback.answer(f"Ошибка загрузки: {err[:40]}", show_alert=True)
+        await callback.answer(f"Ошибка: {err[:40]}", show_alert=True)
         return
 
     display_path = path.replace("disk:/", "/")
@@ -326,8 +321,8 @@ async def init_replace_handler(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"🔄 <b>Замена на новую версию</b>\n\n"
         f"Вы обновляете: <code>{file_info['name']}</code>\n\n"
-        f"Отправьте новый документ в чат (без сжатия).\n"
-        f"<i>Старая версия будет перезаписана.</i>",
+        f"Отправьте новый документ в этот чат (без сжатия).\n"
+        f"<i>Старая версия будет заменена на актуальную.</i>",
         reply_markup=cancel_kb,
         parse_mode="HTML"
     )
