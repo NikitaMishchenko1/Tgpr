@@ -1,4 +1,3 @@
-import os
 import io
 import asyncio
 import aiohttp
@@ -17,8 +16,8 @@ from aiogram.types import (
 )
 
 # ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8734513499:AAFZDaHlEjpaX6ortyReXvOsZVkILjuvvXg").strip()
-YANDEX_TOKEN = os.getenv("YANDEX_TOKEN", "y0__wgBEPjki3kYxbdJIKmdtv8YNq9Bg5R3dWWoq0DKsy4y1UoSCJk").strip()
+BOT_TOKEN = "8734513499:AAFZDaHlEjpaX6ortyReXvOsZVkILjuvvXg".strip()
+YANDEX_TOKEN = "y0__wgBEPjki3kYxbdJIKmdtv8YNq9Bg5R3dWWoq0DKsy4y1UoSCJk".strip()
 ALLOWED_USERS = [659684962, 5509198477]
 ROOT_DIR = "disk:/TelegramBot"
 # ================================================
@@ -60,6 +59,7 @@ YANDEX_HEADERS = {
 API_URL = "https://cloud-api.yandex.net/v1/disk/resources"
 
 async def yd_create_folder(path: str) -> tuple[bool, str]:
+    """Создает папку и возвращает (успех, сообщение ошибки)"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.put(API_URL, params={"path": path}) as resp:
             if resp.status in (201, 409):
@@ -68,6 +68,7 @@ async def yd_create_folder(path: str) -> tuple[bool, str]:
             return False, f"HTTP {resp.status}: {err_text}"
 
 async def yd_get_contents(path: str) -> tuple[list[dict], str]:
+    """Получает содержимое папки с локальной сортировкой"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.get(API_URL, params={"path": path, "limit": 100}) as resp:
             if resp.status != 200:
@@ -83,14 +84,14 @@ async def yd_upload_file(path: str, file_bytes: bytes) -> tuple[bool, str]:
         async with session.get(f"{API_URL}/upload", params={"path": path, "overwrite": "true"}) as resp:
             if resp.status != 200:
                 err = await resp.text()
-                return False, f"Ошибка ссылки загрузки ({resp.status}): {err}"
+                return False, f"Ошибка получения ссылки ({resp.status}): {err}"
             upload_url = (await resp.json()).get("href")
 
         async with session.put(upload_url, data=file_bytes) as upload_resp:
             if upload_resp.status in (201, 202):
                 return True, ""
             err = await upload_resp.text()
-            return False, f"Ошибка передачи файла ({upload_resp.status}): {err}"
+            return False, f"Ошибка загрузки байтов ({upload_resp.status}): {err}"
 
 async def yd_download_file(path: str) -> bytes | None:
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
@@ -199,10 +200,14 @@ async def start_handler(message: Message, state: FSMContext):
     await state.clear()
     success, err = await yd_create_folder(ROOT_DIR)
     if not success:
+        # Диагностический вывод: показывает, какой именно токен сейчас отправляет бот
+        masked_token = f"{YANDEX_TOKEN[:8]}...{YANDEX_TOKEN[-4:]}" if len(YANDEX_TOKEN) > 12 else "INVALID_LENGTH"
         await message.answer(
             f"⚠️ <b>Ошибка доступа к Яндекс Диску!</b>\n\n"
             f"Код: <code>{err}</code>\n\n"
-            f"Проверьте статус токена и приватность репозитория.",
+            f"<b>Диагностика токена:</b>\n"
+            f"Используемый ключ: <code>{masked_token}</code> (длина: {len(YANDEX_TOKEN)} симв.)\n\n"
+            f"<i>Если ключ отозван Яндексом, получите свежий в 1 клик на yandex.ru/dev/disk/poligon/</i>",
             parse_mode="HTML"
         )
         return
@@ -213,7 +218,7 @@ async def start_handler(message: Message, state: FSMContext):
         return
 
     kb = get_folder_keyboard(ROOT_DIR, items)
-    await message.answer("☁️ <b>Файлы проектов на Яндекс Диске:</b>", reply_markup=kb, parse_mode="HTML")
+    await message.answer("☁️ <b>Файлы проектов на Яндекс Диске (v2.2):</b>", reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("nav_dir:"))
 async def navigate_dir(callback: CallbackQuery, state: FSMContext):
