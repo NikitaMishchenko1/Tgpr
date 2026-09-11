@@ -17,7 +17,7 @@ from aiogram.types import (
 
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "8734513499:AAFZDaHlEjpaX6ortyReXvOsZVkILjuvvXg"
-YANDEX_TOKEN = "y0__wgBEPjki3kYgZ1JILi2__sYLPDQfkenDEMWbYxyndaagHUROe0"
+YANDEX_TOKEN = "y0__wgBEPjki3kYxbdJIKmdtv8YNq9Bg5R3dWWoq0DKsy4y1UoSCJk"
 ALLOWED_USERS = [659684962, 5509198477]
 ROOT_DIR = "disk:/TelegramBot"
 # ================================================
