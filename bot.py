@@ -515,10 +515,40 @@ async def process_rename(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Ошибка при переименовании.")
 
+# Исправленная кнопка отмены
 @dp.callback_query(F.data == "cancel_fsm")
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ALLOWED_USERS:
+        await callback.answer("Доступ закрыт", show_alert=True)
+        return
+
+    data = await state.get_data()
+    target_path = data.get("target_path", ROOT_DIR)
+    item_id = data.get("item_id")
     await state.clear()
-    await start_handler(callback.message, state)
+
+    if item_id and item_id in items_cache:
+        file_info = items_cache[item_id]
+        parent_path = file_info["path"].rsplit("/", 1)[0]
+        size_mb = file_info["size"] / (1024 * 1024)
+        await callback.message.edit_text(
+            f"📄 <b>Файл / Проект:</b> <code>{file_info['name']}</code>\n"
+            f"📊 <b>Размер:</b> <code>{size_mb:.2f} МБ</code>\n\n"
+            f"Выберите действие:",
+            reply_markup=get_file_actions_keyboard(item_id, parent_path),
+            parse_mode="HTML"
+        )
+    else:
+        folder_path = target_path if "." not in target_path.split("/")[-1] else target_path.rsplit("/", 1)[0]
+        items = await yd_get_contents(folder_path)
+        display_path = folder_path.replace("disk:/", "/")
+        await callback.message.edit_text(
+            f"📁 <b>Текущая папка:</b> <code>{display_path}</code>",
+            reply_markup=get_folder_keyboard(folder_path, items),
+            parse_mode="HTML"
+        )
+
+    await callback.answer("Действие отменено.")
 
 
 # ================= ЗАПУСК =================
