@@ -18,7 +18,7 @@ from aiogram.types import (
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "8734513499:AAFZDaHlEjpaX6ortyReXvOsZVkILjuvvXg"
 YANDEX_TOKEN = "y0__wgBEPjki3kYgZ1JILi2__sYLPDQfkenDEMWbYxyndaaGhUROe0"
-ALLOWED_USERS = [659684962] [5509198477]  # Telegram ID пользователей, которым открыт доступ
+ALLOWED_USERS = [659684962, 5509198477]  # Telegram ID пользователей, которым открыт доступ
 ROOT_DIR = "disk:/TelegramBot"  # Базовая папка в Яндекс Диске
 # ================================================
 
