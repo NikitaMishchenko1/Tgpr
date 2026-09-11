@@ -2,6 +2,8 @@ import io
 import asyncio
 import aiohttp
 import zipfile
+import urllib.parse
+from datetime import datetime
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -25,7 +27,7 @@ _t_part2 = "xbdJIKmdtv8YNq9Bg5R3dWWoq0DKsy4y1UoSCJk"
 YANDEX_TOKEN = f"{_t_part1}{_t_part2}".strip()
 
 ALLOWED_USERS = [659684962, 5509198477]  # ID пользователей с доступом
-ROOT_DIR = "disk:/TelegramBot"            # Закрытая базовая папка
+ROOT_DIR = "disk:/TelegramBot"            # Базовая приватная папка
 # ================================================
 
 bot = Bot(token=BOT_TOKEN)
@@ -42,6 +44,23 @@ class BotStates(StatesGroup):
     waiting_for_replace_folder_zip = State()
     waiting_for_folder_rename = State()
 
+def get_file_icon(name: str) -> str:
+    """Определяет умную иконку по расширению файла САПР / ЧПУ"""
+    ext = Path(name).suffix.lower()
+    if ext in [".prt", ".sldprt", ".catpart", ".ipt"]:
+        return "🧩"
+    if ext in [".step", ".stp", ".iges", ".igs", ".sat", ".x_t", ".x_b"]:
+        return "📦"
+    if ext in [".dwg", ".dxf", ".pdf"]:
+        return "📐"
+    if ext in [".nc", ".tap", ".gcode", ".mpf", ".cnc", ".apt"]:
+        return "⚙️"
+    if ext in [".zip", ".rar", ".7z", ".tar", ".gz"]:
+        return "🗜️"
+    if ext in [".txt", ".doc", ".docx", ".xls", ".xlsx"]:
+        return "📝"
+    return "📄"
+
 def cache_item(path: str, name: str, is_dir: bool, size: int = 0) -> int:
     for item_id, item in items_cache.items():
         if item["path"] == path:
@@ -49,6 +68,12 @@ def cache_item(path: str, name: str, is_dir: bool, size: int = 0) -> int:
     item_id = len(items_cache) + 1
     items_cache[item_id] = {"path": path, "name": name, "is_dir": is_dir, "size": size}
     return item_id
+
+def get_yandex_web_url(disk_path: str) -> str:
+    """Генерирует защищенную ссылку на закрытую веб-папку в интерфейсе Яндекс Диска"""
+    clean_path = disk_path.replace("disk:/", "").strip("/")
+    encoded_path = urllib.parse.quote(clean_path)
+    return f"https://disk.yandex.ru/client/disk/{encoded_path}"
 
 async def notify_team(sender_id: int, text: str):
     """Оповещение участников команды об изменениях"""
@@ -77,7 +102,7 @@ async def yd_create_folder(path: str) -> tuple[bool, str]:
             return False, f"HTTP {resp.status}: {err_text}"
 
 async def yd_unpublish_resource(path: str):
-    """Принудительно отзывает публичную ссылку, делая ресурс приватным"""
+    """Принудительно отзывает публичный статус, гарантируя приватность файлов"""
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         await session.put(f"{API_URL}/unpublish", params={"path": path})
 
@@ -123,13 +148,18 @@ async def yd_move_rename(from_path: str, to_path: str) -> bool:
         async with session.post(f"{API_URL}/move", params={"from": from_path, "path": to_path, "overwrite": "false"}) as resp:
             return resp.status in (201, 202)
 
+async def yd_copy_resource(from_path: str, to_path: str) -> bool:
+    """Копирует ресурс внутри Яндекс Диска (для архивирования версий)"""
+    async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
+        async with session.post(f"{API_URL}/copy", params={"from": from_path, "path": to_path, "overwrite": "true"}) as resp:
+            return resp.status in (201, 202)
+
 async def yd_delete_resource(path: str) -> bool:
     async with aiohttp.ClientSession(headers=YANDEX_HEADERS) as session:
         async with session.delete(API_URL, params={"path": path, "permanently": "false"}) as resp:
             return resp.status in (202, 204)
 
 async def yd_get_all_files_recursive(folder_path: str) -> list[dict]:
-    """Рекурсивно получает список всех файлов внутри папки и её поддиректорий"""
     all_files = []
     queue = [folder_path]
     visited = 0
@@ -188,14 +218,16 @@ def get_folder_keyboard(current_path: str, items: list[dict]) -> InlineKeyboardM
         item_type = item.get("type") or item.get("resource_type")
         if item_type == "dir":
             item_id = cache_item(item["path"], item["name"], True)
-            buttons.append([InlineKeyboardButton(text=f"📁 {item['name']}", callback_data=f"nav_dir:{item_id}")])
+            folder_icon = "🕒" if item["name"] == "_history" else "📁"
+            buttons.append([InlineKeyboardButton(text=f"{folder_icon} {item['name']}", callback_data=f"nav_dir:{item_id}")])
 
-    # 2. Список файлов
+    # 2. Список файлов с умными иконками САПР
     for item in items:
         item_type = item.get("type") or item.get("resource_type")
         if item_type == "file":
             item_id = cache_item(item["path"], item["name"], False, item.get("size", 0))
-            buttons.append([InlineKeyboardButton(text=f"📄 {item['name']}", callback_data=f"nav_file:{item_id}")])
+            icon = get_file_icon(item["name"])
+            buttons.append([InlineKeyboardButton(text=f"{icon} {item['name']}", callback_data=f"nav_file:{item_id}")])
 
     cur_id = cache_item(current_path, current_path.split("/")[-1], True)
 
@@ -205,14 +237,15 @@ def get_folder_keyboard(current_path: str, items: list[dict]) -> InlineKeyboardM
         InlineKeyboardButton(text="📁 Создать папку", callback_data=f"add_folder:{cur_id}")
     ])
 
-    # Управление текущей папкой (если это не корневая директория)
     if current_path != ROOT_DIR:
         buttons.append([
             InlineKeyboardButton(text="⚙️ Действия с этой папкой", callback_data=f"folder_manage:{cur_id}")
         ])
 
+    web_link = get_yandex_web_url(current_path)
     buttons.append([
-        InlineKeyboardButton(text="🔍 Поиск по проектам", callback_data=f"act_search:{cur_id}")
+        InlineKeyboardButton(text="🔍 Поиск по проектам", callback_data=f"act_search:{cur_id}"),
+        InlineKeyboardButton(text="↗️ Открыть на Диске", url=web_link)
     ])
 
     if current_path != ROOT_DIR:
@@ -223,6 +256,9 @@ def get_folder_keyboard(current_path: str, items: list[dict]) -> InlineKeyboardM
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_folder_management_keyboard(folder_id: int) -> InlineKeyboardMarkup:
+    folder_info = items_cache.get(folder_id, {"path": ROOT_DIR})
+    web_link = get_yandex_web_url(folder_info["path"])
+
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="⬇️ Скачать папку (.ZIP)", callback_data=f"act_down_dir:{folder_id}"),
@@ -233,20 +269,28 @@ def get_folder_management_keyboard(folder_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑️ Удалить папку", callback_data=f"act_del_dir_conf:{folder_id}")
         ],
         [
+            InlineKeyboardButton(text="↗️ Открыть папку в браузере", url=web_link)
+        ],
+        [
             InlineKeyboardButton(text="⬅️ Назад к содержимому", callback_data=f"nav_dir:{folder_id}")
         ]
     ])
 
 def get_file_actions_keyboard(item_id: int, parent_path: str) -> InlineKeyboardMarkup:
     parent_id = cache_item(parent_path, parent_path.split("/")[-1], True)
+    web_link = get_yandex_web_url(parent_path)
+
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="⬇️ Скачать файл", callback_data=f"act_download:{item_id}"),
-            InlineKeyboardButton(text="🔄 Заменить ревизию", callback_data=f"act_replace:{item_id}")
+            InlineKeyboardButton(text="🔄 Заменить ревизию (бэкап в _history)", callback_data=f"act_replace:{item_id}")
         ],
         [
             InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"act_rename:{item_id}"),
             InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"act_delete_confirm:{item_id}")
+        ],
+        [
+            InlineKeyboardButton(text="↗️ Папка файла на Диске", url=web_link)
         ],
         [
             InlineKeyboardButton(text="⬅️ Назад в папку", callback_data=f"nav_dir:{parent_id}")
@@ -281,7 +325,8 @@ def get_search_results_keyboard(results: list[dict], current_folder_id: int) -> 
             buttons.append([InlineKeyboardButton(text=f"📁 {display_label}", callback_data=f"nav_dir:{item_id}")])
         else:
             item_id = cache_item(item["path"], name, False, item.get("size", 0))
-            buttons.append([InlineKeyboardButton(text=f"📄 {display_label}", callback_data=f"nav_file:{item_id}")])
+            icon = get_file_icon(name)
+            buttons.append([InlineKeyboardButton(text=f"{icon} {display_label}", callback_data=f"nav_file:{item_id}")])
 
     buttons.append([InlineKeyboardButton(text="⬅️ Назад к папкам", callback_data=f"nav_dir:{current_folder_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -352,10 +397,12 @@ async def show_file_menu(callback: CallbackQuery, state: FSMContext):
 
     size_mb = file_info["size"] / (1024 * 1024)
     parent_path = file_info["path"].rsplit("/", 1)[0]
+    icon = get_file_icon(file_info["name"])
 
     await callback.message.edit_text(
-        f"📄 <b>Проект / Модель:</b> <code>{file_info['name']}</code>\n"
-        f"📊 <b>Размер:</b> <code>{size_mb:.2f} МБ</code>\n\n"
+        f"{icon} <b>Проект / Файл:</b> <code>{file_info['name']}</code>\n"
+        f"📊 <b>Размер:</b> <code>{size_mb:.2f} МБ</code>\n"
+        f"🔒 <b>Хранилище:</b> Приватное\n\n"
         f"Выберите действие:",
         reply_markup=get_file_actions_keyboard(item_id, parent_path),
         parse_mode="HTML"
@@ -363,7 +410,7 @@ async def show_file_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# ================= УПРАВЛЕНИЕ ПАПКАМИ (СКАЧАТЬ / ЗАМЕНИТЬ / УДАЛИТЬ) =================
+# ================= УПРАВЛЕНИЕ ПАПКАМИ =================
 
 @dp.callback_query(F.data.startswith("folder_manage:"))
 async def manage_folder_menu(callback: CallbackQuery, state: FSMContext):
@@ -390,7 +437,6 @@ async def manage_folder_menu(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-# 1. Скачать папку (ZIP)
 @dp.callback_query(F.data.startswith("act_down_dir:"))
 async def download_folder_as_zip_handler(callback: CallbackQuery):
     if callback.from_user.id not in ALLOWED_USERS:
@@ -401,21 +447,21 @@ async def download_folder_as_zip_handler(callback: CallbackQuery):
     path = folder_info["path"]
     folder_name = folder_info["name"]
 
-    await callback.answer("⏳ Собираю файлы папки в ZIP-архив...")
+    await callback.answer("⏳ Собираю ZIP-архив...")
     wait_msg = await callback.message.answer(f"📦 <i>Формирую архив папки <b>{folder_name}</b>...</i>", parse_mode="HTML")
 
     files = await yd_get_all_files_recursive(path)
     if not files:
         await wait_msg.delete()
-        await callback.message.answer(f"⚠️ Папка <code>{folder_name}</code> пуста, нечего скачивать.", parse_mode="HTML")
+        await callback.message.answer(f"⚠️ Папка <code>{folder_name}</code> пуста.", parse_mode="HTML")
         return
 
     total_size = sum(f.get("size", 0) for f in files)
     if total_size > 49.5 * 1024 * 1024:
         await wait_msg.delete()
         await callback.message.answer(
-            f"⚠️ Общий объем файлов папки (<b>{total_size / (1024*1024):.1f} МБ</b>) превышает лимит отправки через Telegram (50 МБ).\n"
-            f"Используйте общую синхронизируемую папку на ПК.",
+            f"⚠️ Общий размер файлов (<b>{total_size / (1024*1024):.1f} МБ</b>) превышает лимит Telegram (50 МБ).\n"
+            f"Откройте её через общую папку на ПК.",
             parse_mode="HTML"
         )
         return
@@ -440,9 +486,8 @@ async def download_folder_as_zip_handler(callback: CallbackQuery):
     )
 
     doc = BufferedInputFile(zip_buffer.getvalue(), filename=f"{folder_name}.zip")
-    await callback.message.answer_document(doc, caption=f"📦 Проект: <b>{folder_name}</b> (ZIP-архив)", parse_mode="HTML")
+    await callback.message.answer_document(doc, caption=f"📦 Проект: <b>{folder_name}</b>", parse_mode="HTML")
 
-# 2. Заменить папку архивом
 @dp.callback_query(F.data.startswith("act_rep_dir:"))
 async def init_replace_folder(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ALLOWED_USERS:
@@ -457,7 +502,7 @@ async def init_replace_folder(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"🔄 <b>Замена содержимого папки {folder_info['name']}</b>\n\n"
         f"Отправьте <code>.zip</code> архив с новым проектом.\n"
-        f"<i>⚠️ Внимание: старое содержимое папки будет заменено файлами из присланного архива!</i>",
+        f"<i>⚠️ Старое содержимое будет заменено файлами из архива.</i>",
         reply_markup=cancel_kb,
         parse_mode="HTML"
     )
@@ -466,29 +511,26 @@ async def init_replace_folder(callback: CallbackQuery, state: FSMContext):
 @dp.message(BotStates.waiting_for_replace_folder_zip, F.document)
 async def process_replace_folder_zip(message: Message, state: FSMContext):
     if not message.document.file_name.lower().endswith(".zip"):
-        await message.answer("⚠️ Пожалуйста, пришлите файл в формате <code>.zip</code> архива.", reply_markup=cancel_kb, parse_mode="HTML")
+        await message.answer("⚠️ Пришлите файл в формате <code>.zip</code> архива.", reply_markup=cancel_kb, parse_mode="HTML")
         return
 
     if message.document.file_size > 20 * 1024 * 1024:
-        await message.answer("⚠️ Размер архива больше 20 МБ (лимит загрузки в бот).", reply_markup=cancel_kb)
+        await message.answer("⚠️ Архив больше 20 МБ (лимит загрузки в бот).", reply_markup=cancel_kb)
         return
 
     data = await state.get_data()
     target_path = data.get("target_folder_path")
     folder_name = data.get("folder_name")
-    folder_id = data.get("folder_id")
 
-    status_msg = await message.answer("⏳ Распаковываю и обновляю проект на Яндекс Диске...")
+    status_msg = await message.answer("⏳ Распаковываю и сохраняю на Яндекс Диске...")
 
     stream = io.BytesIO()
     await bot.download(message.document, destination=stream)
     stream.seek(0)
 
-    # 1. Пересоздаем папку для очистки старого содержимого
     await yd_delete_resource(target_path)
     await yd_create_folder(target_path)
 
-    # 2. Заливаем всё из ZIP
     try:
         with zipfile.ZipFile(stream, "r") as zf:
             for item in zf.infolist():
@@ -517,20 +559,19 @@ async def process_replace_folder_zip(message: Message, state: FSMContext):
     user_mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
     await notify_team(
         sender_id=message.from_user.id,
-        text=f"🔄 <b>Папка проекта полностью заменена!</b>\n"
+        text=f"🔄 <b>Папка проекта заменена из архива!</b>\n"
              f"👤 Пользователь: {user_mention}\n"
              f"📁 Каталог: <code>{folder_name}</code>\n"
-             f"📦 Новый архив: <code>{message.document.file_name}</code>"
+             f"📦 Архив: <code>{message.document.file_name}</code>"
     )
 
     items, _ = await yd_get_contents(target_path)
     await message.answer(
-        f"✅ Проект в папке <code>{folder_name}</code> успешно обновлен из архива!",
+        f"✅ Содержимое папки <code>{folder_name}</code> успешно обновлено!",
         reply_markup=get_folder_keyboard(target_path, items),
         parse_mode="HTML"
     )
 
-# 3. Переименовать папку
 @dp.callback_query(F.data.startswith("act_ren_dir:"))
 async def init_rename_folder(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ALLOWED_USERS:
@@ -567,9 +608,9 @@ async def process_rename_folder(message: Message, state: FSMContext):
         await notify_team(
             sender_id=message.from_user.id,
             text=f"✏️ <b>Папка переименована</b>\n"
-                 f"👤 Пользователь: {user_mention}\n"
-                 f"📁 Было: <code>{old_name}</code>\n"
-                 f"📁 Стало: <code>{new_name}</code>"
+             f"👤 Пользователь: {user_mention}\n"
+             f"📁 Было: <code>{old_name}</code>\n"
+             f"📁 Стало: <code>{new_name}</code>"
         )
 
         items, _ = await yd_get_contents(new_path)
@@ -581,7 +622,6 @@ async def process_rename_folder(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Ошибка при переименовании папки.")
 
-# 4. Удалить папку (Запрос подтверждения)
 @dp.callback_query(F.data.startswith("act_del_dir_conf:"))
 async def confirm_delete_folder_prompt(callback: CallbackQuery):
     if callback.from_user.id not in ALLOWED_USERS:
@@ -592,7 +632,7 @@ async def confirm_delete_folder_prompt(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"❓ <b>Подтверждение удаления папки</b>\n\n"
-        f"Вы действительно хотите удалить папку <code>{folder_info['name']}</code> со всеми её файлами?\n"
+        f"Удалить папку <code>{folder_info['name']}</code> со всеми вложенными файлами?\n"
         f"<i>(Она будет перемещена в Корзину Яндекс Диска)</i>",
         reply_markup=get_confirm_delete_folder_keyboard(folder_id),
         parse_mode="HTML"
@@ -628,7 +668,7 @@ async def delete_folder_confirmed(callback: CallbackQuery):
     )
 
 
-# ================= ОПЕРАЦИИ С ФАЙЛАМИ =================
+# ================= ОПЕРАЦИИ С ФАЙЛАМИ (С АВТОАРХИВИРОВАНИЕМ) =================
 
 @dp.callback_query(F.data.startswith("act_download:"))
 async def download_handler(callback: CallbackQuery):
@@ -639,7 +679,7 @@ async def download_handler(callback: CallbackQuery):
     file_info = items_cache.get(item_id)
 
     if file_info["size"] > 49.5 * 1024 * 1024:
-        await callback.answer("Файл больше 50 МБ. Скачайте через синхронизацию на ПК.", show_alert=True)
+        await callback.answer("Файл больше 50 МБ. Используйте синхронизацию на ПК.", show_alert=True)
         return
 
     await callback.answer("Скачиваю из Яндекс Диска...")
@@ -647,11 +687,12 @@ async def download_handler(callback: CallbackQuery):
 
     if file_bytes:
         user_mention = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.full_name
+        icon = get_file_icon(file_info["name"])
         await notify_team(
             sender_id=callback.from_user.id,
             text=f"⬇️ <b>Файл скачан</b>\n"
                  f"👤 Пользователь: {user_mention}\n"
-                 f"📄 Проект: <code>{file_info['name']}</code>"
+                 f"{icon} Проект: <code>{file_info['name']}</code>"
         )
         document = BufferedInputFile(file_bytes, filename=file_info["name"])
         await callback.message.answer_document(document)
@@ -665,15 +706,16 @@ async def init_replace_handler(callback: CallbackQuery, state: FSMContext):
 
     item_id = int(callback.data.split(":")[1])
     file_info = items_cache.get(item_id)
+    icon = get_file_icon(file_info["name"])
 
     await state.set_state(BotStates.waiting_for_replace_file)
     await state.update_data(item_id=item_id, target_path=file_info["path"], file_name=file_info["name"])
 
     await callback.message.edit_text(
         f"🔄 <b>Замена на новую версию (Ревизию)</b>\n\n"
-        f"Вы обновляете: <code>{file_info['name']}</code>\n\n"
+        f"Вы обновляете: {icon} <code>{file_info['name']}</code>\n\n"
         f"Отправьте новый документ в чат (без сжатия).\n"
-        f"<i>Старая версия будет перезаписана в приватном хранилище.</i>",
+        f"<i>💡 Старая версия файла будет автоматически сохранена в архивную папку <code>_history</code> с меткой времени.</i>",
         reply_markup=cancel_kb,
         parse_mode="HTML"
     )
@@ -690,8 +732,19 @@ async def process_replace_file(message: Message, state: FSMContext):
     original_name = data.get("file_name")
     parent_path = target_path.rsplit("/", 1)[0]
 
-    load_msg = await message.answer("⏳ Сохраняю новую ревизию...")
+    load_msg = await message.answer("⏳ Архивирую прошлую версию и сохраняю новую...")
 
+    # 1. Автобэкап старой версии в папку _history
+    history_folder = f"{parent_path}/_history"
+    await yd_create_folder(history_folder)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = Path(original_name).stem
+    ext = Path(original_name).suffix
+    backup_path = f"{history_folder}/{stem}_rev_{timestamp}{ext}"
+    await yd_copy_resource(target_path, backup_path)
+
+    # 2. Загрузка новой ревизии
     stream = io.BytesIO()
     await bot.download(message.document, destination=stream)
     file_bytes = stream.getvalue()
@@ -702,17 +755,20 @@ async def process_replace_file(message: Message, state: FSMContext):
 
     if success:
         user_mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+        icon = get_file_icon(original_name)
         await notify_team(
             sender_id=message.from_user.id,
             text=f"📢 <b>Обновлена ревизия проекта!</b>\n"
                  f"👤 Автор: {user_mention}\n"
-                 f"📄 Файл: <code>{original_name}</code>\n"
-                 f"📁 Каталог: <code>{parent_path.replace('disk:/', '/')}</code>"
+                 f"{icon} Файл: <code>{original_name}</code>\n"
+                 f"📁 Каталог: <code>{parent_path.replace('disk:/', '/')}</code>\n"
+                 f"🕒 <i>Предыдущая копия сохранена в _history</i>"
         )
 
         items, _ = await yd_get_contents(parent_path)
         await message.answer(
-            f"✅ Файл <code>{original_name}</code> успешно обновлен на актуальную версию!",
+            f"✅ Файл <code>{original_name}</code> успешно обновлен на актуальную версию!\n"
+            f"<i>Архивная копия сохранена в <code>_history</code>.</i>",
             reply_markup=get_folder_keyboard(parent_path, items),
             parse_mode="HTML"
         )
@@ -726,10 +782,11 @@ async def confirm_delete_prompt(callback: CallbackQuery):
 
     item_id = int(callback.data.split(":")[1])
     file_info = items_cache.get(item_id)
+    icon = get_file_icon(file_info["name"])
 
     await callback.message.edit_text(
         f"❓ <b>Подтверждение удаления файла</b>\n\n"
-        f"Удалить проект <code>{file_info['name']}</code>?\n"
+        f"Удалить проект {icon} <code>{file_info['name']}</code>?\n"
         f"<i>(Файл переместится в Корзину Яндекс Диска)</i>",
         reply_markup=get_confirm_delete_keyboard(item_id),
         parse_mode="HTML"
@@ -744,6 +801,7 @@ async def delete_confirmed_handler(callback: CallbackQuery):
     item_id = int(callback.data.split(":")[1])
     file_info = items_cache.get(item_id)
     parent_path = file_info["path"].rsplit("/", 1)[0]
+    icon = get_file_icon(file_info["name"])
 
     await yd_delete_resource(file_info["path"])
     await callback.answer("Файл удален.")
@@ -753,7 +811,7 @@ async def delete_confirmed_handler(callback: CallbackQuery):
         sender_id=callback.from_user.id,
         text=f"🗑️ <b>Проект удален</b>\n"
              f"👤 Пользователь: {user_mention}\n"
-             f"📄 Файл: <code>{file_info['name']}</code>"
+             f"{icon} Файл: <code>{file_info['name']}</code>"
     )
 
     items, _ = await yd_get_contents(parent_path)
@@ -805,17 +863,18 @@ async def process_file_upload(message: Message, state: FSMContext):
 
     if success:
         user_mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+        icon = get_file_icon(filename)
         await notify_team(
             sender_id=message.from_user.id,
             text=f"📥 <b>Новый проект добавлен!</b>\n"
                  f"👤 Автор: {user_mention}\n"
-                 f"📄 Файл: <code>{filename}</code>\n"
+                 f"{icon} Файл: <code>{filename}</code>\n"
                  f"📁 Папка: <code>{target_path.replace('disk:/', '/')}</code>"
         )
 
         items, _ = await yd_get_contents(target_path)
         await message.answer(
-            f"✅ Файл <code>{filename}</code> добавлен!",
+            f"✅ Файл {icon} <code>{filename}</code> добавлен!",
             reply_markup=get_folder_keyboard(target_path, items),
             parse_mode="HTML"
         )
@@ -901,17 +960,19 @@ async def process_rename(message: Message, state: FSMContext):
 
     if success:
         user_mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+        old_icon = get_file_icon(file_info['name'])
+        new_icon = get_file_icon(new_name)
         await notify_team(
             sender_id=message.from_user.id,
             text=f"✏️ <b>Файл переименован</b>\n"
                  f"👤 Пользователь: {user_mention}\n"
-                 f"📄 Было: <code>{file_info['name']}</code>\n"
-                 f"📄 Стало: <code>{new_name}</code>"
+                 f"📄 Было: {old_icon} <code>{file_info['name']}</code>\n"
+                 f"📄 Стало: {new_icon} <code>{new_name}</code>"
         )
 
         items, _ = await yd_get_contents(parent_path)
         await message.answer(
-            f"✅ Переименовано в <code>{new_name}</code>",
+            f"✅ Переименовано в {new_icon} <code>{new_name}</code>",
             reply_markup=get_folder_keyboard(parent_path, items),
             parse_mode="HTML"
         )
@@ -929,7 +990,7 @@ async def init_search_handler(callback: CallbackQuery, state: FSMContext):
     await state.update_data(current_folder_id=folder_id)
 
     await callback.message.edit_text(
-        "🔍 <b>Поиск по закрытому архиву проектов</b>\n\n"
+        "🔍 <b>Поиск по архиву проектов</b>\n\n"
         "Введите часть названия детали, папки или расширение (например: <code>корпус</code>, <code>.prt</code>, <code>.step</code>):",
         reply_markup=cancel_kb,
         parse_mode="HTML"
@@ -1001,8 +1062,9 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
         file_info = items_cache[item_id]
         parent_path = file_info["path"].rsplit("/", 1)[0]
         size_mb = file_info["size"] / (1024 * 1024)
+        icon = get_file_icon(file_info["name"])
         await callback.message.edit_text(
-            f"📄 <b>Проект / Модель:</b> <code>{file_info['name']}</code>\n"
+            f"{icon} <b>Проект / Файл:</b> <code>{file_info['name']}</code>\n"
             f"📊 <b>Размер:</b> <code>{size_mb:.2f} МБ</code>\n\n"
             f"Выберите действие:",
             reply_markup=get_file_actions_keyboard(item_id, parent_path),
@@ -1024,7 +1086,7 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
 # ================= ЗАПУСК =================
 
 async def main():
-    print("Бот запущен с поддержкой управления папками и проектами.")
+    print("Бот запущен с поддержкой архивирования версий и умных иконок САПР.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
